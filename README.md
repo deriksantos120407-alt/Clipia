@@ -1,12 +1,14 @@
-# ClipIA — site pronto
+# ClipIA — versão corrigida para Vercel
 
-## Rodar localmente
-```bash
-npm install
-npm run dev
-```
+Esta versão contém a pasta `app/` na raiz do projeto, que estava faltando.
 
-Abra http://localhost:3000
+## No GitHub
+Envie TODO o conteúdo desta pasta para a raiz do repositório:
 
-## Publicar
-Pode ser publicado em Vercel, Railway ou outro host compatível com Next.js.
+- app/
+- package.json
+- tsconfig.json
+- next-env.d.ts
+- README.md
+
+Depois de enviar, a Vercel deve criar uma nova implantação automaticamente.
