@@ -3,13 +3,10 @@
 import { useState } from 'react';
 
 export default function Home() {
-  const data = await ffmpeg.readFile(out);
+  const [file, setFile] = useState<File | null>(null);
+  const [status, setStatus] = useState('');
 
-if (typeof data === "string") {
-  throw new Error("Falha ao gerar o vídeo.");
-}
-
-const blob = new Blob([new Uint8Array(data)], { type: "video/mp4" });
+  function criar() {
 
   function criar() {
     setStatus(
