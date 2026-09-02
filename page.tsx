@@ -6,7 +6,7 @@ export default function Home() {
   const [file, setFile] = useState<File | null>(null);
   const [status, setStatus] = useState('');
 
-  function criar() {
+  
 
   function criar() {
     setStatus(
