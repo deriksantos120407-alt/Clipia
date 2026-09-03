@@ -84,8 +84,9 @@ export default function Home() {
         }}
       >
         Automação com IA
-      </div>
+      
     </section>
-  </main>
+  </div>
+</main>
 );
 }
