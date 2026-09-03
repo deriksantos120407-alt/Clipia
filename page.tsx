@@ -80,4 +80,12 @@ export default function Home() {
               background: '#18112f',
               color: '#b99cff',
               padding: '8px 14px',
-              borderRadius: '
+              borderRadius: ''20px',
+        }}
+      >
+        Automação com IA
+      </div>
+    </section>
+  </main>
+);
+}
