@@ -83,10 +83,9 @@ export default function Home() {
               borderRadius: ''20px',
         }}
       >
-        Automação com IA
-      
+                Automação com IA
+      </div>
     </section>
-  </div>
-</main>
+  </main>
 );
-}
+              }
