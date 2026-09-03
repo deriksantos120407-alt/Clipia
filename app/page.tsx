@@ -285,8 +285,8 @@ const blob = new Blob([bytes], { type: "video/mp4" });
 
         <footer className="footer">
           © 2026 ClipIA · Use somente conteúdo próprio ou autorizado.
-        </footer>
-            </main>
-    </div>
+                </footer>
+      </div>
+    </main>
   );
 }
