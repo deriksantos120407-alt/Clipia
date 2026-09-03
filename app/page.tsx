@@ -120,7 +120,11 @@ export default function Home() {
         ]);
 
         const data = await ffmpeg.readFile(out);
-        const blob = new Blob([data], { type: "video/mp4" });
+const bytes =
+  data instanceof Uint8Array
+    ? new Uint8Array(data)
+    : new TextEncoder().encode(data);
+const blob = new Blob([bytes], { type: "video/mp4" });
         const url = URL.createObjectURL(blob);
 
         generated.push({
