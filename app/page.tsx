@@ -76,24 +76,42 @@ export default function Home() {
 
     setStatus("Canal encontrado. Salvando a automação...");
     const { data: saved, error } = await supabase.from("automations").insert({
-      user_id: user.id, channel_url: channelUrl.trim(), cuts_per_video: cuts, clip_duration: duration,
+      user_id: user.id, channel_url: channelUrl.trim(), channel_id: youtube.channel?.id,
+      last_video_id: youtube.latestVideo?.id ?? null, last_video_title: youtube.latestVideo?.title ?? null,
+      last_checked_at: new Date().toISOString(), cuts_per_video: cuts, clip_duration: duration,
       captions_enabled: captions, automation_enabled: automation, instagram_enabled: instagram,
       instagram_auto_publish: instagram && instagramAuto, tiktok_enabled: tiktok,
       tiktok_auto_publish: tiktok && tiktokAuto,
     }).select("id").single();
     if (error) { setStatus(`Erro ao salvar: ${error.message}`); setBusy(false); return; }
 
+    if (youtube.latestVideo?.id && youtube.latestVideo.url) {
+      setStatus("Criando o trabalho de processamento...");
+      const { error: jobError } = await supabase.from("processing_jobs").upsert({
+        automation_id: saved.id,
+        user_id: user.id,
+        source_video_id: youtube.latestVideo.id,
+        source_video_url: youtube.latestVideo.url,
+        source_video_title: youtube.latestVideo.title ?? null,
+        requested_cuts: cuts,
+        clip_duration: duration,
+        captions_enabled: captions,
+        status: "queued",
+      }, { onConflict: "user_id,source_video_id" });
+      if (jobError) { setStatus(`Erro ao criar processamento: ${jobError.message}`); setBusy(false); return; }
+    }
+
     const steps = [
       { stage: "Canal conectado", status: "done", detail: youtube.channel?.title ?? channelUrl.trim() },
       { stage: "Último vídeo detectado", status: youtube.latestVideo ? "done" : "active", detail: youtube.latestVideo?.title ?? "Nenhum vídeo público encontrado" },
       { stage: "Monitoramento", status: automation ? "active" : "done", detail: automation ? "Novos vídeos serão detectados" : "Configuração salva" },
-      { stage: "Cortes configurados", status: "active", detail: `${cuts} cortes de ${duration}s` },
+      { stage: youtube.latestVideo ? "Processamento enfileirado" : "Cortes configurados", status: "active", detail: `${cuts} cortes de ${duration}s` },
     ].map((item) => ({ ...item, automation_id: saved.id, user_id: user.id }));
 
     const historyResult = await supabase.from("automation_history").insert(steps).select("*");
     if (historyResult.data) setHistory([...(historyResult.data as HistoryItem[]).reverse(), ...history]);
     setStatus(youtube.latestVideo
-      ? `Automação salva. Vídeo mais recente: ${youtube.latestVideo.title}`
+      ? `Vídeo enfileirado para gerar os cortes: ${youtube.latestVideo.title}`
       : "Automação salva. O canal ainda não possui vídeo público.");
     setBusy(false);
   }
