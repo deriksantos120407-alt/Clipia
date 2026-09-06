@@ -5,6 +5,11 @@ import type { User } from "@supabase/supabase-js";
 import { createClient } from "../lib/supabase";
 
 type HistoryItem = { id: string; stage: string; status: string; detail: string | null; created_at: string };
+type YouTubeResult = {
+  error?: string;
+  channel?: { id: string; title?: string };
+  latestVideo?: { id?: string; title?: string; publishedAt?: string; url?: string } | null;
+};
 
 export default function Home() {
   const supabase = useMemo(() => createClient(), []);
@@ -48,9 +53,28 @@ export default function Home() {
   async function saveAutomation(event: FormEvent) {
     event.preventDefault();
     if (!user) return setStatus("Entre na sua conta antes de continuar.");
-    if (!/^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(channelUrl.trim())) return setStatus("Informe um link válido do YouTube.");
+    if (!/^https?:\/\/(www\.)?(youtube\.com|m\.youtube\.com)\//i.test(channelUrl.trim())) return setStatus("Informe o link de um canal do YouTube.");
+
     setBusy(true);
-    setStatus("Salvando a automação do canal...");
+    setStatus("Localizando o canal e o vídeo mais recente...");
+
+    const { data: { session } } = await supabase.auth.getSession();
+    const youtubeResponse = await fetch("/api/youtube/latest", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${session?.access_token ?? ""}`,
+      },
+      body: JSON.stringify({ channelUrl: channelUrl.trim() }),
+    });
+    const youtube = await youtubeResponse.json() as YouTubeResult;
+    if (!youtubeResponse.ok) {
+      setStatus(`Erro no YouTube: ${youtube.error ?? "não foi possível consultar o canal."}`);
+      setBusy(false);
+      return;
+    }
+
+    setStatus("Canal encontrado. Salvando a automação...");
     const { data: saved, error } = await supabase.from("automations").insert({
       user_id: user.id, channel_url: channelUrl.trim(), cuts_per_video: cuts, clip_duration: duration,
       captions_enabled: captions, automation_enabled: automation, instagram_enabled: instagram,
@@ -58,19 +82,24 @@ export default function Home() {
       tiktok_auto_publish: tiktok && tiktokAuto,
     }).select("id").single();
     if (error) { setStatus(`Erro ao salvar: ${error.message}`); setBusy(false); return; }
+
     const steps = [
-      { stage: "Canal conectado", status: "done", detail: channelUrl.trim() },
-      { stage: "Monitoramento ativado", status: automation ? "active" : "done", detail: automation ? "Novos vídeos serão detectados" : "Configuração salva" },
-      { stage: "Aguardando novo vídeo", status: "active", detail: `${cuts} cortes de ${duration}s` },
+      { stage: "Canal conectado", status: "done", detail: youtube.channel?.title ?? channelUrl.trim() },
+      { stage: "Último vídeo detectado", status: youtube.latestVideo ? "done" : "active", detail: youtube.latestVideo?.title ?? "Nenhum vídeo público encontrado" },
+      { stage: "Monitoramento", status: automation ? "active" : "done", detail: automation ? "Novos vídeos serão detectados" : "Configuração salva" },
+      { stage: "Cortes configurados", status: "active", detail: `${cuts} cortes de ${duration}s` },
     ].map((item) => ({ ...item, automation_id: saved.id, user_id: user.id }));
+
     const historyResult = await supabase.from("automation_history").insert(steps).select("*");
     if (historyResult.data) setHistory([...(historyResult.data as HistoryItem[]).reverse(), ...history]);
-    setStatus("Automação do canal salva. Pronto para monitorar e processar novos vídeos.");
+    setStatus(youtube.latestVideo
+      ? `Automação salva. Vídeo mais recente: ${youtube.latestVideo.title}`
+      : "Automação salva. O canal ainda não possui vídeo público.");
     setBusy(false);
   }
 
   return <main><div className="wrap">
-    <nav className="nav"><div className="brand">ClipIA</div><div className="badge">{user ? user.email : "Fase 1 conectada"}</div></nav>
+    <nav className="nav"><div className="brand">ClipIA</div><div className="badge">{user ? user.email : "Fase 2 conectada"}</div></nav>
     <section className="hero"><span className="heroTag">YouTube → cortes → redes sociais</span><h1>Transforme seu canal em uma máquina de cortes.</h1><p>Entre, informe o canal do YouTube e configure seus cortes automáticos.</p></section>
     {!user && <section className="auth card">
       <div><span className="muted small">SUA CONTA</span><h2>Entrar no ClipIA</h2></div>
@@ -90,7 +119,7 @@ export default function Home() {
         </div>
         <div className="toggleList"><Toggle label="Legendas automáticas" checked={captions} onChange={setCaptions}/><Toggle label="Automação para novos vídeos" checked={automation} onChange={setAutomation}/></div>
         <div className="socialGrid"><Social name="Instagram" enabled={instagram} setEnabled={setInstagram} auto={instagramAuto} setAuto={setInstagramAuto}/><Social name="TikTok" enabled={tiktok} setEnabled={setTiktok} auto={tiktokAuto} setAuto={setTiktokAuto}/></div>
-        <button className="btn" disabled={busy}>{busy ? "Salvando..." : "Salvar automação"}</button>
+        <button className="btn" disabled={busy}>{busy ? "Verificando..." : "Conectar canal e salvar"}</button>
         <div className="status" aria-live="polite">{status}</div>
         <button className="textButton" type="button" onClick={() => supabase.auth.signOut()}>Sair da conta</button>
       </form>
