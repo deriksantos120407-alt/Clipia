@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
 
 const YOUTUBE_API = "https://www.googleapis.com/youtube/v3";
 
@@ -16,9 +17,7 @@ async function youtube(path: string, params: Record<string, string>) {
 function readChannelReference(value: string) {
   const url = new URL(value);
   const host = url.hostname.replace(/^www\./, "");
-  if (host !== "youtube.com" && host !== "m.youtube.com") {
-    throw new Error("Use o link de um canal do YouTube.");
-  }
+  if (host !== "youtube.com" && host !== "m.youtube.com") throw new Error("Use o link de um canal do YouTube.");
   const parts = url.pathname.split("/").filter(Boolean);
   if (!parts.length) throw new Error("Link do canal incompleto.");
   if (parts[0] === "channel" && parts[1]) return { kind: "id", value: parts[1] };
@@ -29,13 +28,21 @@ function readChannelReference(value: string) {
 
 export async function POST(request: NextRequest) {
   try {
+    const token = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
+    if (!supabaseUrl || !supabaseKey) return NextResponse.json({ error: "Supabase não configurado." }, { status: 503 });
+    if (!token) return NextResponse.json({ error: "Faça login para conectar um canal." }, { status: 401 });
+    const supabase = createClient(supabaseUrl, supabaseKey);
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) return NextResponse.json({ error: "Sessão inválida. Entre novamente." }, { status: 401 });
+
     const body = await request.json();
     const channelUrl = typeof body?.channelUrl === "string" ? body.channelUrl.trim() : "";
     if (!channelUrl) return NextResponse.json({ error: "Informe o link do canal." }, { status: 400 });
 
     const reference = readChannelReference(channelUrl);
     let channelData;
-
     if (reference.kind === "id") {
       channelData = await youtube("channels", { part: "snippet,contentDetails", id: reference.value });
     } else if (reference.kind === "handle") {
@@ -54,13 +61,8 @@ export async function POST(request: NextRequest) {
     const uploads = channel.contentDetails?.relatedPlaylists?.uploads;
     if (!uploads) throw new Error("Não foi possível acessar os vídeos do canal.");
 
-    const videos = await youtube("playlistItems", {
-      part: "snippet,contentDetails",
-      playlistId: uploads,
-      maxResults: "1",
-    });
+    const videos = await youtube("playlistItems", { part: "snippet,contentDetails", playlistId: uploads, maxResults: "1" });
     const latest = videos.items?.[0];
-
     return NextResponse.json({
       channel: { id: channel.id, title: channel.snippet?.title },
       latestVideo: latest ? {
