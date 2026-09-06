@@ -1,6 +1,6 @@
 {
   "name": "clipia-site-pronto",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "private": true,
   "scripts": {
     "dev": "next dev",
@@ -8,12 +8,10 @@
     "start": "next start"
   },
   "dependencies": {
-  "@ffmpeg/ffmpeg": "^0.12.15",
-  "@ffmpeg/util": "^0.12.2",
-  "next": "15.5.21",
-  "react": "19.1.1",
-  "react-dom": "19.1.1"
-
+    "@supabase/supabase-js": "2.115.0",
+    "next": "15.5.21",
+    "react": "19.1.1",
+    "react-dom": "19.1.1"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",
