@@ -1,159 +1,54 @@
 "use client";
 
-import { useRef, useState } from "react";
-import { FFmpeg } from "@ffmpeg/ffmpeg";
-import { fetchFile, toBlobURL } from "@ffmpeg/util";
+import { useMemo, useState } from "react";
 
-type Clip = {
-  id: number;
-  url: string;
-  start: number;
-  duration: number;
-  name: string;
-};
+type StepStatus = "pending" | "active" | "done";
+type Step = { label: string; status: StepStatus };
 
-function getVideoDuration(file: File): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const video = document.createElement("video");
-    const url = URL.createObjectURL(file);
-    video.preload = "metadata";
-    video.onloadedmetadata = () => {
-      const d = video.duration;
-      URL.revokeObjectURL(url);
-      if (Number.isFinite(d)) resolve(d);
-      else reject(new Error("Não foi possível ler a duração do vídeo."));
-    };
-    video.onerror = () => {
-      URL.revokeObjectURL(url);
-      reject(new Error("Formato de vídeo não suportado pelo navegador."));
-    };
-    video.src = url;
-  });
-}
+const initialSteps: Step[] = [
+  { label: "Canal do YouTube conectado", status: "pending" },
+  { label: "Vídeo encontrado", status: "pending" },
+  { label: "Melhores momentos analisados", status: "pending" },
+  { label: "Cortes e legendas preparados", status: "pending" },
+  { label: "Publicação nas redes", status: "pending" },
+];
 
 export default function Home() {
-  const ffmpegRef = useRef<FFmpeg | null>(null);
-  const [file, setFile] = useState<File | null>(null);
+  const [channelUrl, setChannelUrl] = useState("");
   const [cuts, setCuts] = useState(3);
-  const [clipDuration, setClipDuration] = useState(20);
-  const [status, setStatus] = useState("Selecione um vídeo para começar.");
-  const [progress, setProgress] = useState(0);
-  const [working, setWorking] = useState(false);
-  const [clips, setClips] = useState<Clip[]>([]);
+  const [duration, setDuration] = useState(30);
+  const [captions, setCaptions] = useState(true);
+  const [automation, setAutomation] = useState(false);
+  const [instagram, setInstagram] = useState(false);
+  const [tiktok, setTiktok] = useState(false);
+  const [instagramAuto, setInstagramAuto] = useState(false);
+  const [tiktokAuto, setTiktokAuto] = useState(false);
+  const [steps, setSteps] = useState<Step[]>(initialSteps);
+  const [status, setStatus] = useState("Cole o link do seu canal para configurar a automação.");
 
-  async function loadFFmpeg() {
-    if (ffmpegRef.current) return ffmpegRef.current;
+  const validChannel = useMemo(
+    () => /^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(channelUrl.trim()),
+    [channelUrl]
+  );
 
-    setStatus("Carregando o motor de vídeo pela primeira vez...");
-    const ffmpeg = new FFmpeg();
-
-    ffmpeg.on("progress", ({ progress }) => {
-      if (Number.isFinite(progress)) {
-        setProgress(Math.max(3, Math.min(98, Math.round(progress * 100))));
-      }
-    });
-
-    const baseURL = "https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm";
-    await ffmpeg.load({
-      coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, "text/javascript"),
-      wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, "application/wasm"),
-    });
-
-    ffmpegRef.current = ffmpeg;
-    return ffmpeg;
-  }
-
-  async function createCuts() {
-    if (!file) {
-      setStatus("Escolha um vídeo antes de continuar.");
+  function saveConfiguration() {
+    if (!validChannel) {
+      setStatus("Informe um link válido do YouTube.");
       return;
     }
 
-    if (file.size > 500 * 1024 * 1024) {
-      setStatus("Para esta versão, use um vídeo de até 500 MB.");
-      return;
-    }
+    setSteps(
+      initialSteps.map((step, index) => ({
+        ...step,
+        status: index === 0 ? "done" : index === 1 ? "active" : "pending",
+      }))
+    );
 
-    setWorking(true);
-    setProgress(1);
-
-    clips.forEach((clip) => URL.revokeObjectURL(clip.url));
-    setClips([]);
-
-    try {
-      const total = await getVideoDuration(file);
-      const duration = Math.min(clipDuration, Math.max(3, Math.floor(total)));
-      const maxStart = Math.max(0, total - duration);
-
-      const wantedCuts = Math.min(cuts, Math.max(1, Math.floor(total / Math.max(1, duration / 2))));
-      const starts = Array.from({ length: wantedCuts }, (_, i) =>
-        wantedCuts === 1 ? 0 : Math.round((maxStart * i) / (wantedCuts - 1))
-      );
-
-      const ffmpeg = await loadFFmpeg();
-      setStatus("Preparando vídeo...");
-      const ext = file.name.split(".").pop()?.toLowerCase() || "mp4";
-      const inputName = `entrada.${ext}`;
-      await ffmpeg.writeFile(inputName, await fetchFile(file));
-
-      const generated: Clip[] = [];
-
-      for (let i = 0; i < starts.length; i++) {
-        const start = starts[i];
-        const out = `clip-${i + 1}.mp4`;
-        setStatus(`Criando corte ${i + 1} de ${starts.length}...`);
-        setProgress(Math.round((i / starts.length) * 90) + 5);
-
-        await ffmpeg.exec([
-          "-ss", String(start),
-          "-i", inputName,
-          "-t", String(duration),
-          "-vf",
-          "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280",
-          "-c:v", "libx264",
-          "-preset", "ultrafast",
-          "-crf", "25",
-          "-c:a", "aac",
-          "-b:a", "128k",
-          "-movflags", "+faststart",
-          out,
-        ]);
-
-        const data = await ffmpeg.readFile(out);
-const bytes =
-  data instanceof Uint8Array
-    ? new Uint8Array(data)
-    : new TextEncoder().encode(data);
-const blob = new Blob([bytes], { type: "video/mp4" });
-        const url = URL.createObjectURL(blob);
-
-        generated.push({
-          id: i + 1,
-          url,
-          start,
-          duration,
-          name: `clipia-corte-${i + 1}.mp4`,
-        });
-
-        try { await ffmpeg.deleteFile(out); } catch {}
-      }
-
-      try { await ffmpeg.deleteFile(inputName); } catch {}
-
-      setClips(generated);
-      setProgress(100);
-      setStatus(`Pronto! ${generated.length} corte(s) criado(s).`);
-    } catch (error) {
-      console.error(error);
-      setProgress(0);
-      setStatus(
-        error instanceof Error
-          ? `Erro: ${error.message}`
-          : "Não foi possível processar o vídeo."
-      );
-    } finally {
-      setWorking(false);
-    }
+    setStatus(
+      automation
+        ? "Automação configurada. Agora falta conectar as APIs e o processamento no servidor."
+        : "Configuração salva nesta tela. Ative a automação para processar novos vídeos automaticamente."
+    );
   }
 
   return (
@@ -161,132 +56,132 @@ const blob = new Blob([bytes], { type: "video/mp4" });
       <div className="wrap">
         <nav className="nav">
           <div className="brand">ClipIA</div>
-          <div className="badge">Processamento no navegador</div>
+          <div className="badge">Automação de cortes com IA</div>
         </nav>
 
         <section className="hero">
-          <span className="heroTag">Cortes verticais em poucos cliques</span>
-          <h1>Transforme vídeos longos em cortes prontos para postar.</h1>
+          <span className="heroTag">YouTube → cortes → redes sociais</span>
+          <h1>Transforme seu canal em uma máquina de cortes.</h1>
           <p>
-            Envie um vídeo que você possui ou tem autorização para reutilizar.
-            O processamento acontece no próprio dispositivo e os cortes ficam
-            disponíveis para download.
+            Conecte o canal do YouTube, escolha como os cortes devem ser criados e deixe o ClipIA preparar seu fluxo de publicação.
           </p>
         </section>
 
         <section className="grid">
           <div className="card">
-            <h2>Criar cortes</h2>
-            <p className="muted">
-              Recomendado: MP4, vídeo de até 500 MB e computador/notebook.
-            </p>
+            <h2>Configurar automação</h2>
+            <p className="muted">Use apenas canais e conteúdos que você possui ou tem autorização para reutilizar.</p>
 
-            <label className="label">Escolha o vídeo</label>
+            <label className="label" htmlFor="channel">Link do canal do YouTube</label>
             <input
+              id="channel"
               className="field"
-              type="file"
-              accept="video/mp4,video/webm,video/quicktime"
-              disabled={working}
-              onChange={(e) => {
-                setFile(e.target.files?.[0] ?? null);
-                setStatus(e.target.files?.[0] ? `Selecionado: ${e.target.files[0].name}` : "Selecione um vídeo.");
-              }}
+              type="url"
+              placeholder="https://www.youtube.com/@seucanal"
+              value={channelUrl}
+              onChange={(e) => setChannelUrl(e.target.value)}
             />
 
             <div className="row">
               <div>
-                <label className="label">Quantidade</label>
-                <select
-                  className="field"
-                  value={cuts}
-                  disabled={working}
-                  onChange={(e) => setCuts(Number(e.target.value))}
-                >
-                  <option value={1}>1 corte</option>
+                <label className="label">Cortes por vídeo</label>
+                <select className="field" value={cuts} onChange={(e) => setCuts(Number(e.target.value))}>
                   <option value={3}>3 cortes</option>
                   <option value={5}>5 cortes</option>
+                  <option value={10}>10 cortes</option>
                 </select>
               </div>
-
               <div>
                 <label className="label">Duração</label>
-                <select
-                  className="field"
-                  value={clipDuration}
-                  disabled={working}
-                  onChange={(e) => setClipDuration(Number(e.target.value))}
-                >
+                <select className="field" value={duration} onChange={(e) => setDuration(Number(e.target.value))}>
                   <option value={15}>15 segundos</option>
-                  <option value={20}>20 segundos</option>
                   <option value={30}>30 segundos</option>
                   <option value={45}>45 segundos</option>
+                  <option value={60}>60 segundos</option>
                 </select>
               </div>
             </div>
 
-            <button className="btn" disabled={working || !file} onClick={createCuts}>
-              {working ? "Processando vídeo..." : "Gerar cortes verticais"}
-            </button>
-
-            <div className="status">
-              {status}
-              {working && (
-                <div className="progress">
-                  <span style={{ width: `${progress}%` }} />
-                </div>
-              )}
+            <div className="toggleList">
+              <Toggle label="Legendas automáticas" checked={captions} onChange={setCaptions} />
+              <Toggle label="Automação para novos vídeos" checked={automation} onChange={setAutomation} />
             </div>
 
-            <div className="note small">
-              A primeira execução demora um pouco mais porque o navegador precisa
-              carregar o motor FFmpeg. Não feche a aba durante o processamento.
+            <div className="socialGrid">
+              <SocialCard name="Instagram" enabled={instagram} setEnabled={setInstagram} auto={instagramAuto} setAuto={setInstagramAuto} />
+              <SocialCard name="TikTok" enabled={tiktok} setEnabled={setTiktok} auto={tiktokAuto} setAuto={setTiktokAuto} />
             </div>
+
+            <button className="btn" onClick={saveConfiguration}>Salvar configuração</button>
+            <div className="status">{status}</div>
           </div>
 
           <aside className="card">
-            <div className="muted small">PLANO ATUAL</div>
-            <h2 style={{ fontSize: 32, marginBottom: 4 }}>Free</h2>
-            <p className="muted">Versão de teste do ClipIA.</p>
-
-            <div className="plans">
-              <div className="plan"><span>Basic</span><b>R$29/mês</b></div>
-              <div className="plan"><span>Pro</span><b>R$59/mês</b></div>
-              <div className="plan"><span>Agency</span><b>R$149/mês</b></div>
+            <div className="muted small">RESUMO</div>
+            <h2>{cuts} cortes · {duration}s</h2>
+            <div className="summary">
+              <span>Legendas</span><b>{captions ? "ON" : "OFF"}</b>
+              <span>Automação</span><b>{automation ? "ON" : "OFF"}</b>
+              <span>Instagram</span><b>{instagram ? (instagramAuto ? "Auto" : "Ativo") : "OFF"}</b>
+              <span>TikTok</span><b>{tiktok ? (tiktokAuto ? "Auto" : "Ativo") : "OFF"}</b>
             </div>
-
             <div className="note small">
-              Nesta versão, os cortes são distribuídos automaticamente pelo vídeo.
-              A seleção dos melhores momentos por IA pode ser conectada depois.
+              Esta interface deixa o fluxo pronto. Para buscar vídeos, gerar cortes reais, criar legendas e publicar automaticamente, ainda é necessário conectar as APIs e um backend de processamento.
             </div>
           </aside>
         </section>
 
-        {clips.length > 0 && (
-          <section className="results">
-            <h2>Seus cortes</h2>
-            <div className="resultGrid">
-              {clips.map((clip) => (
-                <article className="clip" key={clip.id}>
-                  <video src={clip.url} controls playsInline />
-                  <div className="clipBody">
-                    <strong>Corte {clip.id}</strong>
-                    <p className="muted small">
-                      Início: {clip.start}s · Duração: {clip.duration}s
-                    </p>
-                    <a className="download" href={clip.url} download={clip.name}>
-                      Baixar MP4
-                    </a>
-                  </div>
-                </article>
-              ))}
-            </div>
-          </section>
-        )}
+        <section className="history card">
+          <div>
+            <div className="muted small">HISTÓRICO DA AUTOMAÇÃO</div>
+            <h2>Etapas do fluxo</h2>
+          </div>
+          <div className="steps">
+            {steps.map((step, index) => (
+              <div className={`step ${step.status}`} key={step.label}>
+                <span className="stepDot">{step.status === "done" ? "✓" : index + 1}</span>
+                <div>
+                  <strong>{step.label}</strong>
+                  <p>{step.status === "done" ? "Concluído" : step.status === "active" ? "Aguardando integração" : "Pendente"}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
 
-        <footer className="footer">
-          © 2026 ClipIA · Use somente conteúdo próprio ou autorizado.
-                </footer>
+        <footer className="footer">© 2026 ClipIA · Use somente conteúdo próprio ou autorizado.</footer>
       </div>
     </main>
+  );
+}
+
+function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (value: boolean) => void }) {
+  return (
+    <label className="toggleRow">
+      <span>{label}</span>
+      <input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} />
+    </label>
+  );
+}
+
+function SocialCard({ name, enabled, setEnabled, auto, setAuto }: { name: string; enabled: boolean; setEnabled: (value: boolean) => void; auto: boolean; setAuto: (value: boolean) => void }) {
+  return (
+    <div className="socialCard">
+      <label className="toggleRow">
+        <strong>{name}</strong>
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => {
+            setEnabled(e.target.checked);
+            if (!e.target.checked) setAuto(false);
+          }}
+        />
+      </label>
+      <label className="autoOption">
+        <input type="checkbox" checked={auto} disabled={!enabled} onChange={(e) => setAuto(e.target.checked)} />
+        Publicação automática
+      </label>
+    </div>
   );
 }
