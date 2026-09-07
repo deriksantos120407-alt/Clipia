@@ -29,5 +29,6 @@ export async function GET(request: NextRequest) {
 
   const checkoutUrl = new URL(paymentLink);
   checkoutUrl.searchParams.set("prefilled_email", data.user.email);
+  checkoutUrl.searchParams.set("client_reference_id", data.user.id);
   return NextResponse.json({ url: checkoutUrl.toString() });
 }
