@@ -3,8 +3,10 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import type { User } from "@supabase/supabase-js";
 import { createClient } from "../lib/supabase";
+import { getPlanByPriceId, PLANS, type PlanKey } from "../lib/billing";
 
 type HistoryItem = { id: string; stage: string; status: string; detail: string | null; created_at: string };
+type Subscription = { stripe_price_id: string | null; status: string; current_period_end: string | null };
 type YouTubeResult = {
   error?: string;
   channel?: { id: string; title?: string };
@@ -13,7 +15,9 @@ type YouTubeResult = {
 
 export default function Home() {
   const supabase = useMemo(() => createClient(), []);
+  const billingEnabled = process.env.NEXT_PUBLIC_BILLING_ENABLED === "true";
   const [user, setUser] = useState<User | null>(null);
+  const [subscription, setSubscription] = useState<Subscription | null>(null);
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [channelUrl, setChannelUrl] = useState("");
@@ -29,6 +33,9 @@ export default function Home() {
   const [status, setStatus] = useState("Entre para salvar sua automação.");
   const [busy, setBusy] = useState(false);
 
+  const activeSubscription = subscription ? ["active", "trialing"].includes(subscription.status) : false;
+  const currentPlan = getPlanByPriceId(subscription?.stripe_price_id);
+
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => setUser(data.user));
     const { data } = supabase.auth.onAuthStateChange((_event, session) => setUser(session?.user ?? null));
@@ -36,10 +43,26 @@ export default function Home() {
   }, [supabase]);
 
   useEffect(() => {
-    if (!user) return;
+    if (!user) {
+      setSubscription(null);
+      setHistory([]);
+      return;
+    }
+
     supabase.from("automation_history").select("*").order("created_at", { ascending: false }).limit(12)
       .then(({ data }) => setHistory((data as HistoryItem[]) ?? []));
+
+    supabase.from("subscriptions").select("stripe_price_id,status,current_period_end").maybeSingle()
+      .then(({ data }) => setSubscription((data as Subscription | null) ?? null));
   }, [supabase, user]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("payment") === "success") {
+      setStatus("Pagamento concluído. A assinatura será liberada assim que a Stripe confirmar.");
+    }
+  }, []);
 
   async function authenticate(mode: "login" | "signup") {
     setBusy(true);
@@ -50,9 +73,36 @@ export default function Home() {
     setBusy(false);
   }
 
+  async function choosePlan(plan: PlanKey) {
+    if (!user) {
+      setStatus("Entre ou crie sua conta antes de escolher um plano.");
+      document.querySelector(".auth")?.scrollIntoView({ behavior: "smooth" });
+      return;
+    }
+    if (!billingEnabled) {
+      setStatus("Os pagamentos estão aguardando a liberação da Stripe.");
+      return;
+    }
+
+    setBusy(true);
+    setStatus("Abrindo pagamento seguro da Stripe...");
+    const { data: { session } } = await supabase.auth.getSession();
+    const response = await fetch(`/api/billing/checkout?plan=${plan}`, {
+      headers: { Authorization: `Bearer ${session?.access_token ?? ""}` },
+    });
+    const payload = await response.json() as { url?: string; error?: string };
+    if (!response.ok || !payload.url) {
+      setStatus(payload.error ?? "Não foi possível abrir o pagamento.");
+      setBusy(false);
+      return;
+    }
+    window.location.href = payload.url;
+  }
+
   async function saveAutomation(event: FormEvent) {
     event.preventDefault();
     if (!user) return setStatus("Entre na sua conta antes de continuar.");
+    if (billingEnabled && !activeSubscription) return setStatus("Escolha um plano e ative sua assinatura antes de criar automações.");
     if (!/^https?:\/\/(www\.)?(youtube\.com|m\.youtube\.com)\//i.test(channelUrl.trim())) return setStatus("Informe o link de um canal do YouTube.");
 
     setBusy(true);
@@ -117,8 +167,28 @@ export default function Home() {
   }
 
   return <main><div className="wrap">
-    <nav className="nav"><div className="brand">ClipIA</div><div className="badge">{user ? user.email : "Fase 2 conectada"}</div></nav>
+    <nav className="nav"><div className="brand">ClipIA</div><div className="badge">{user ? user.email : "YouTube → cortes automáticos"}</div></nav>
     <section className="hero"><span className="heroTag">YouTube → cortes → redes sociais</span><h1>Transforme seu canal em uma máquina de cortes.</h1><p>Entre, informe o canal do YouTube e configure seus cortes automáticos.</p></section>
+
+    <section className="pricing" id="planos">
+      <div className="sectionHeading"><span className="muted small">PLANOS MENSAIS</span><h2>Escolha o plano do ClipIA</h2><p className="muted">Os planos já estão criados na Stripe. A cobrança será ativada assim que a análise da conta for concluída.</p></div>
+      <div className="pricingGrid">
+        {PLANS.map((plan) => {
+          const isCurrent = activeSubscription && currentPlan?.key === plan.key;
+          return <article className={`priceCard ${plan.key === "pro" ? "featured" : ""}`} key={plan.key}>
+            {plan.key === "pro" && <span className="popular">POPULAR</span>}
+            <h3>{plan.name}</h3>
+            <div className="price"><strong>{plan.priceLabel}</strong><span>/mês</span></div>
+            <p>{plan.description}</p>
+            <ul><li>Assinatura mensal</li><li>Acesso ao ClipIA</li><li>Pagamento seguro pela Stripe</li></ul>
+            <button className="btn planButton" type="button" disabled={busy || isCurrent || !billingEnabled} onClick={() => choosePlan(plan.key)}>
+              {isCurrent ? "Plano atual" : billingEnabled ? `Assinar ${plan.name}` : "Aguardando Stripe"}
+            </button>
+          </article>;
+        })}
+      </div>
+    </section>
+
     {!user && <section className="auth card">
       <div><span className="muted small">SUA CONTA</span><h2>Entrar no ClipIA</h2></div>
       <input className="field" type="email" placeholder="Seu e-mail" value={email} onChange={(e) => setEmail(e.target.value)} />
@@ -127,8 +197,14 @@ export default function Home() {
       <button className="btn secondary" disabled={busy} onClick={() => authenticate("signup")}>Criar conta</button>
       <div className="status">{status}</div>
     </section>}
+
     {user && <section className="grid">
       <form className="card" onSubmit={saveAutomation}>
+        <div className={`subscriptionBox ${activeSubscription ? "active" : "waiting"}`}>
+          <span className="small">ASSINATURA</span>
+          <strong>{activeSubscription ? `${currentPlan?.name ?? "Plano"} ativo` : billingEnabled ? "Sem assinatura ativa" : "Pagamentos em análise"}</strong>
+          <span>{activeSubscription && subscription?.current_period_end ? `Renovação prevista: ${new Date(subscription.current_period_end).toLocaleDateString("pt-BR")}` : billingEnabled ? "Escolha um plano acima para liberar as automações." : "A Stripe ainda está revisando a conta de pagamentos."}</span>
+        </div>
         <h2>Configurar automação</h2>
         <label className="label">Link do canal do YouTube</label><input className="field" type="url" placeholder="https://youtube.com/@seucanal" value={channelUrl} onChange={(e) => setChannelUrl(e.target.value)} required />
         <div className="row">
@@ -136,8 +212,8 @@ export default function Home() {
           <div><label className="label">Duração</label><select className="field" value={duration} onChange={(e) => setDuration(Number(e.target.value))}><option value={15}>15 segundos</option><option value={30}>30 segundos</option><option value={45}>45 segundos</option><option value={60}>60 segundos</option></select></div>
         </div>
         <div className="toggleList"><Toggle label="Legendas automáticas" checked={captions} onChange={setCaptions}/><Toggle label="Automação para novos vídeos" checked={automation} onChange={setAutomation}/></div>
-        <div className="socialGrid"><Social name="Instagram" enabled={instagram} setEnabled={setInstagram} auto={instagramAuto} setAuto={setInstagramAuto}/><Social name="TikTok" enabled={tiktok} setEnabled={setTiktok} auto={tiktokAuto} setAuto={setTiktokAuto}/></div>
-        <button className="btn" disabled={busy}>{busy ? "Verificando..." : "Conectar canal e salvar"}</button>
+        <div className="socialGrid"><Social name="Instagram" enabled={instagram} setEnabled={setInstagram} auto={instagramAuto} setAuto={setInstagramAuto}/><Social name="TikTok" enabled={tiktok} setEnabled={setTikTok} auto={tiktokAuto} setAuto={setTikTokAuto}/></div>
+        <button className="btn" disabled={busy || (billingEnabled && !activeSubscription)}>{busy ? "Verificando..." : billingEnabled && !activeSubscription ? "Assinatura necessária" : "Conectar canal e salvar"}</button>
         <div className="status" aria-live="polite">{status}</div>
         <button className="textButton" type="button" onClick={() => supabase.auth.signOut()}>Sair da conta</button>
       </form>
