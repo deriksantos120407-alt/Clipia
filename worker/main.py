@@ -14,11 +14,10 @@ from faster_whisper import WhisperModel
 from pydantic import BaseModel, Field
 from yt_dlp import YoutubeDL
 
-app = FastAPI(title="ClipIA Video Worker", version="1.0.0")
+app = FastAPI(title="ClipIA Video Worker", version="1.1.0")
 
-WORKER_TOKEN = os.getenv("CLIP_WORKER_TOKEN", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_PUBLISHABLE_KEY = os.getenv("SUPABASE_PUBLISHABLE_KEY", "")
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "small")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
@@ -44,39 +43,81 @@ class OutputConfig(BaseModel):
 
 class JobRequest(BaseModel):
     job_id: str
+    automation_id: str
     user_id: str
     source: Source
     output: OutputConfig
-    callback_url: str
 
 
-def require_worker_token(authorization: str | None) -> None:
-    if not WORKER_TOKEN:
-        raise HTTPException(status_code=503, detail="CLIP_WORKER_TOKEN não configurado.")
-    token = ""
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization[7:]
-    if token != WORKER_TOKEN:
-        raise HTTPException(status_code=401, detail="Não autorizado.")
+def supabase_headers(access_token: str, content_type: str = "application/json") -> dict[str, str]:
+    if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
+        raise RuntimeError("Supabase do worker não configurado.")
+    return {
+        "Authorization": f"Bearer {access_token}",
+        "apikey": SUPABASE_PUBLISHABLE_KEY,
+        "Content-Type": content_type,
+    }
 
 
-def send_callback(job: JobRequest, status: str, progress: int, **extra: Any) -> None:
+def require_user_token(authorization: str | None, expected_user_id: str) -> str:
+    token = authorization[7:] if authorization and authorization.startswith("Bearer ") else ""
+    if not token:
+        raise HTTPException(status_code=401, detail="Sessão ausente.")
+    if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
+        raise HTTPException(status_code=503, detail="Supabase do worker não configurado.")
+
+    try:
+        response = requests.get(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "apikey": SUPABASE_PUBLISHABLE_KEY,
+            },
+            timeout=15,
+        )
+    except requests.RequestException as exc:
+        raise HTTPException(status_code=503, detail="Não foi possível validar a sessão.") from exc
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=401, detail="Sessão inválida ou expirada.")
+    user = response.json()
+    if user.get("id") != expected_user_id:
+        raise HTTPException(status_code=403, detail="Usuário não autorizado para este trabalho.")
+    return token
+
+
+def patch_job(job: JobRequest, access_token: str, status: str, progress: int, **extra: Any) -> None:
     payload: dict[str, Any] = {
-        "job_id": job.job_id,
         "status": status,
-        "progress": progress,
+        "progress": max(0, min(100, int(progress))),
+        "updated_at": "now()",
     }
     payload.update(extra)
-    try:
-        response = requests.post(
-            job.callback_url,
-            headers={"Authorization": f"Bearer {WORKER_TOKEN}"},
-            json=payload,
-            timeout=20,
-        )
-        response.raise_for_status()
-    except Exception as exc:
-        print(f"callback failed for {job.job_id}: {exc}", flush=True)
+    response = requests.patch(
+        f"{SUPABASE_URL}/rest/v1/processing_jobs?id=eq.{quote(job.job_id)}&user_id=eq.{quote(job.user_id)}",
+        headers={**supabase_headers(access_token), "Prefer": "return=minimal"},
+        json=payload,
+        timeout=20,
+    )
+    if response.status_code not in {200, 204}:
+        raise RuntimeError(f"Falha ao atualizar processamento: {response.text[:500]}")
+
+
+def add_history(job: JobRequest, access_token: str, stage: str, status: str, detail: str) -> None:
+    response = requests.post(
+        f"{SUPABASE_URL}/rest/v1/automation_history",
+        headers={**supabase_headers(access_token), "Prefer": "return=minimal"},
+        json={
+            "automation_id": job.automation_id,
+            "user_id": job.user_id,
+            "stage": stage,
+            "status": status,
+            "detail": detail,
+        },
+        timeout=20,
+    )
+    if response.status_code not in {200, 201, 204}:
+        print(f"history update failed for {job.job_id}: {response.text[:500]}", flush=True)
 
 
 def get_whisper_model() -> WhisperModel:
@@ -95,8 +136,7 @@ def get_whisper_model() -> WhisperModel:
 def run(command: list[str]) -> None:
     result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
-        tail = result.stderr[-4000:]
-        raise RuntimeError(f"Comando de vídeo falhou: {tail}")
+        raise RuntimeError(f"Comando de vídeo falhou: {result.stderr[-4000:]}")
 
 
 def download_video(url: str, workdir: Path) -> Path:
@@ -116,7 +156,6 @@ def download_video(url: str, workdir: Path) -> Path:
     preferred = workdir / "source.mp4"
     if preferred.exists():
         return preferred
-
     candidates = sorted(workdir.glob("source.*"), key=lambda path: path.stat().st_size, reverse=True)
     if not candidates:
         raise RuntimeError("Não foi possível baixar o vídeo informado.")
@@ -142,13 +181,8 @@ def transcribe(audio_path: Path) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for segment in segments:
         text = segment.text.strip()
-        if not text:
-            continue
-        result.append({
-            "start": float(segment.start),
-            "end": float(segment.end),
-            "text": text,
-        })
+        if text:
+            result.append({"start": float(segment.start), "end": float(segment.end), "text": text})
     if not result:
         raise RuntimeError("Não foi possível transcrever o áudio do vídeo.")
     return result
@@ -187,10 +221,7 @@ def choose_windows(segments: list[dict[str, Any]], count: int, duration: int) ->
     for index, segment in enumerate(segments):
         start = max(0.0, float(segment["start"]) - 0.35)
         end = min(video_end, start + duration)
-        covered = [
-            item for item in segments
-            if float(item["end"]) > start and float(item["start"]) < end
-        ]
+        covered = [item for item in segments if float(item["end"]) > start and float(item["start"]) < end]
         text = " ".join(str(item["text"]).strip() for item in covered).strip()
         if len(text.split()) < max(8, duration // 3):
             continue
@@ -248,58 +279,35 @@ def write_srt(segments: list[dict[str, Any]], start: float, end: float, path: Pa
         text = str(segment["text"]).strip()
         if not text:
             continue
-        blocks.append(
-            f"{index}\n{srt_timestamp(relative_start)} --> {srt_timestamp(relative_end)}\n{text}\n"
-        )
+        blocks.append(f"{index}\n{srt_timestamp(relative_start)} --> {srt_timestamp(relative_end)}\n{text}\n")
         index += 1
     path.write_text("\n".join(blocks), encoding="utf-8")
 
 
-def render_clip(
-    video_path: Path,
-    segments: list[dict[str, Any]],
-    start: float,
-    end: float,
-    captions: bool,
-    output_path: Path,
-    subtitle_path: Path,
-) -> None:
+def render_clip(video_path: Path, segments: list[dict[str, Any]], start: float, end: float, captions: bool, output_path: Path, subtitle_path: Path) -> None:
     duration = max(1.0, end - start)
-    filters = [
-        "scale=1080:1920:force_original_aspect_ratio=increase",
-        "crop=1080:1920",
-    ]
-
+    filters = ["scale=1080:1920:force_original_aspect_ratio=increase", "crop=1080:1920"]
     if captions:
         write_srt(segments, start, end, subtitle_path)
         escaped = subtitle_path.as_posix().replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
         filters.append(
-            "subtitles='{}':force_style='FontName=DejaVu Sans,FontSize=18,"
-            "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,"
-            "Outline=3,Shadow=0,Alignment=2,MarginV=120'".format(escaped)
+            "subtitles='{}':force_style='FontName=DejaVu Sans,FontSize=18,PrimaryColour=&H00FFFFFF,"
+            "OutlineColour=&H00000000,BorderStyle=1,Outline=3,Shadow=0,Alignment=2,MarginV=120'".format(escaped)
         )
-
     run([
-        "ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", str(video_path),
-        "-t", f"{duration:.3f}",
-        "-vf", ",".join(filters),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
-        str(output_path),
+        "ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", str(video_path), "-t", f"{duration:.3f}",
+        "-vf", ",".join(filters), "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(output_path),
     ])
 
 
-def upload_clip(local_path: Path, object_path: str) -> str:
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        raise RuntimeError("Supabase Storage do worker não configurado.")
+def upload_clip(local_path: Path, object_path: str, access_token: str) -> str:
     url = f"{SUPABASE_URL}/storage/v1/object/clips/{quote(object_path, safe='/')}"
     with local_path.open("rb") as file_handle:
         response = requests.post(
             url,
             headers={
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Content-Type": "video/mp4",
+                **supabase_headers(access_token, "video/mp4"),
                 "x-upsert": "true",
             },
             data=file_handle,
@@ -310,24 +318,24 @@ def upload_clip(local_path: Path, object_path: str) -> str:
     return object_path
 
 
-def process_job(job: JobRequest) -> None:
+def process_job(job: JobRequest, access_token: str) -> None:
     with _job_slots:
         workdir = Path(tempfile.mkdtemp(prefix=f"clipia-{job.job_id[:8]}-"))
         try:
-            send_callback(job, "authorizing", 5)
+            patch_job(job, access_token, "authorizing", 5, claimed_at="now()", error=None)
             video_path = download_video(job.source.url, workdir)
 
-            send_callback(job, "transcribing", 25)
+            patch_job(job, access_token, "transcribing", 25)
             audio_path = workdir / "audio.wav"
             extract_audio(video_path, audio_path)
             segments = transcribe(audio_path)
 
-            send_callback(job, "analyzing", 55)
+            patch_job(job, access_token, "analyzing", 55)
             windows = choose_windows(segments, job.output.cuts, job.output.duration_seconds)
             if not windows:
                 raise RuntimeError("Não encontramos trechos adequados para gerar os cortes.")
 
-            send_callback(job, "rendering", 65)
+            patch_job(job, access_token, "rendering", 65)
             clips: list[dict[str, Any]] = []
             total = len(windows)
             for index, window in enumerate(windows, start=1):
@@ -335,17 +343,9 @@ def process_job(job: JobRequest) -> None:
                 subtitle_path = workdir / f"clip-{index}.srt"
                 start = float(window["start"])
                 end = float(window["end"])
-                render_clip(
-                    video_path,
-                    segments,
-                    start,
-                    end,
-                    job.output.captions,
-                    clip_path,
-                    subtitle_path,
-                )
+                render_clip(video_path, segments, start, end, job.output.captions, clip_path, subtitle_path)
                 object_path = f"{job.user_id}/{job.job_id}/clip-{index}.mp4"
-                upload_clip(clip_path, object_path)
+                upload_clip(clip_path, object_path, access_token)
                 text = str(window.get("text", "")).strip()
                 clips.append({
                     "index": index,
@@ -355,7 +355,7 @@ def process_job(job: JobRequest) -> None:
                     "title": (text[:90] + "…") if len(text) > 90 else text,
                 })
                 progress = 65 + round((index / total) * 30)
-                send_callback(job, "rendering", min(progress, 95))
+                patch_job(job, access_token, "rendering", min(progress, 95))
 
             result = {
                 "source_video_id": job.source.video_id,
@@ -364,10 +364,16 @@ def process_job(job: JobRequest) -> None:
                 "captions": job.output.captions,
                 "aspect_ratio": "9:16",
             }
-            send_callback(job, "ready", 100, result=result)
+            patch_job(job, access_token, "ready", 100, result=result, error=None, completed_at="now()")
+            add_history(job, access_token, "Cortes finalizados", "done", f"{len(clips)} cortes prontos para uso.")
         except Exception as exc:
-            print(f"job {job.job_id} failed: {exc}", flush=True)
-            send_callback(job, "failed", 100, error=str(exc)[:1500])
+            message = str(exc)[:1500]
+            print(f"job {job.job_id} failed: {message}", flush=True)
+            try:
+                patch_job(job, access_token, "failed", 100, error=message, completed_at="now()")
+                add_history(job, access_token, "Falha no processamento", "error", message)
+            except Exception as update_exc:
+                print(f"failed to persist job error {job.job_id}: {update_exc}", flush=True)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
@@ -376,17 +382,14 @@ def process_job(job: JobRequest) -> None:
 def health() -> dict[str, Any]:
     return {
         "ok": True,
+        "auth": "supabase-user-session",
         "whisper_model": WHISPER_MODEL_NAME,
         "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
     }
 
 
 @app.post("/jobs")
-def create_job(
-    job: JobRequest,
-    background_tasks: BackgroundTasks,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    require_worker_token(authorization)
-    background_tasks.add_task(process_job, job)
+def create_job(job: JobRequest, background_tasks: BackgroundTasks, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    access_token = require_user_token(authorization, job.user_id)
+    background_tasks.add_task(process_job, job, access_token)
     return {"accepted": True, "job_id": job.job_id}
