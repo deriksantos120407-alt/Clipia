@@ -1,29 +1,79 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
-const YOUTUBE_API = "https://www.googleapis.com/youtube/v3";
+const YOUTUBE_HOSTS = new Set(["youtube.com", "m.youtube.com"]);
 
-async function youtube(path: string, params: Record<string, string>) {
-  const key = process.env.YOUTUBE_API_KEY;
-  if (!key) throw new Error("YOUTUBE_API_KEY não configurada.");
-  const url = new URL(`${YOUTUBE_API}/${path}`);
-  Object.entries({ ...params, key }).forEach(([name, value]) => url.searchParams.set(name, value));
-  const response = await fetch(url, { next: { revalidate: 300 } });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data?.error?.message ?? "Falha ao consultar o YouTube.");
-  return data;
+function decodeXml(value: string) {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
 }
 
 function readChannelReference(value: string) {
   const url = new URL(value);
   const host = url.hostname.replace(/^www\./, "");
-  if (host !== "youtube.com" && host !== "m.youtube.com") throw new Error("Use o link de um canal do YouTube.");
+  if (!YOUTUBE_HOSTS.has(host)) throw new Error("Use o link de um canal do YouTube.");
   const parts = url.pathname.split("/").filter(Boolean);
   if (!parts.length) throw new Error("Link do canal incompleto.");
-  if (parts[0] === "channel" && parts[1]) return { kind: "id", value: parts[1] };
-  if (parts[0].startsWith("@")) return { kind: "handle", value: parts[0].slice(1) };
-  if (parts[0] === "user" && parts[1]) return { kind: "username", value: parts[1] };
-  return { kind: "search", value: parts.at(-1)! };
+  if (parts[0] === "channel" && parts[1]) return { channelId: parts[1], normalizedUrl: value };
+  return { channelId: null, normalizedUrl: value };
+}
+
+async function fetchText(url: string) {
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; ClipIA/1.0; +https://clipia-two.vercel.app)",
+      "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8",
+    },
+    redirect: "follow",
+    next: { revalidate: 300 },
+  });
+  if (!response.ok) throw new Error("Não foi possível acessar o canal no YouTube.");
+  return response.text();
+}
+
+async function resolveChannel(channelUrl: string) {
+  const reference = readChannelReference(channelUrl);
+  if (reference.channelId) return { id: reference.channelId, title: undefined as string | undefined };
+
+  const html = await fetchText(reference.normalizedUrl);
+  const channelId =
+    html.match(/\"channelId\":\"(UC[a-zA-Z0-9_-]{20,})\"/)?.[1] ??
+    html.match(/\"externalId\":\"(UC[a-zA-Z0-9_-]{20,})\"/)?.[1] ??
+    html.match(/<link rel="canonical" href="https:\/\/www\.youtube\.com\/channel\/(UC[a-zA-Z0-9_-]{20,})"/)?.[1] ??
+    html.match(/youtube\.com\/channel\/(UC[a-zA-Z0-9_-]{20,})/)?.[1];
+
+  if (!channelId) throw new Error("Canal não encontrado. Tente usar o link completo do canal.");
+
+  const title =
+    html.match(/<meta property="og:title" content="([^"]+)"/)?.[1] ??
+    html.match(/<title>([^<]+)<\/title>/)?.[1]?.replace(/\s*-\s*YouTube\s*$/i, "");
+
+  return { id: channelId, title: title ? decodeXml(title) : undefined };
+}
+
+async function latestVideoFromFeed(channelId: string) {
+  const xml = await fetchText(`https://www.youtube.com/feeds/videos.xml?channel_id=${encodeURIComponent(channelId)}`);
+  const entry = xml.match(/<entry>([\s\S]*?)<\/entry>/)?.[1];
+  if (!entry) return null;
+
+  const id = entry.match(/<yt:videoId>([^<]+)<\/yt:videoId>/)?.[1];
+  if (!id) return null;
+
+  const title = entry.match(/<title>([\s\S]*?)<\/title>/)?.[1];
+  const publishedAt = entry.match(/<published>([^<]+)<\/published>/)?.[1];
+  const thumbnail = entry.match(/<media:thumbnail url="([^"]+)"/)?.[1];
+
+  return {
+    id,
+    title: title ? decodeXml(title) : undefined,
+    publishedAt,
+    url: `https://www.youtube.com/watch?v=${id}`,
+    thumbnail: thumbnail ? decodeXml(thumbnail) : undefined,
+  };
 }
 
 export async function POST(request: NextRequest) {
@@ -33,6 +83,7 @@ export async function POST(request: NextRequest) {
     const supabaseKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
     if (!supabaseUrl || !supabaseKey) return NextResponse.json({ error: "Supabase não configurado." }, { status: 503 });
     if (!token) return NextResponse.json({ error: "Faça login para conectar um canal." }, { status: 401 });
+
     const supabase = createClient(supabaseUrl, supabaseKey);
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) return NextResponse.json({ error: "Sessão inválida. Entre novamente." }, { status: 401 });
@@ -41,37 +92,12 @@ export async function POST(request: NextRequest) {
     const channelUrl = typeof body?.channelUrl === "string" ? body.channelUrl.trim() : "";
     if (!channelUrl) return NextResponse.json({ error: "Informe o link do canal." }, { status: 400 });
 
-    const reference = readChannelReference(channelUrl);
-    let channelData;
-    if (reference.kind === "id") {
-      channelData = await youtube("channels", { part: "snippet,contentDetails", id: reference.value });
-    } else if (reference.kind === "handle") {
-      channelData = await youtube("channels", { part: "snippet,contentDetails", forHandle: reference.value });
-    } else if (reference.kind === "username") {
-      channelData = await youtube("channels", { part: "snippet,contentDetails", forUsername: reference.value });
-    } else {
-      const search = await youtube("search", { part: "snippet", type: "channel", maxResults: "1", q: reference.value });
-      const channelId = search.items?.[0]?.snippet?.channelId;
-      if (!channelId) throw new Error("Canal não encontrado.");
-      channelData = await youtube("channels", { part: "snippet,contentDetails", id: channelId });
-    }
+    const channel = await resolveChannel(channelUrl);
+    const latestVideo = await latestVideoFromFeed(channel.id);
 
-    const channel = channelData.items?.[0];
-    if (!channel) throw new Error("Canal não encontrado.");
-    const uploads = channel.contentDetails?.relatedPlaylists?.uploads;
-    if (!uploads) throw new Error("Não foi possível acessar os vídeos do canal.");
-
-    const videos = await youtube("playlistItems", { part: "snippet,contentDetails", playlistId: uploads, maxResults: "1" });
-    const latest = videos.items?.[0];
     return NextResponse.json({
-      channel: { id: channel.id, title: channel.snippet?.title },
-      latestVideo: latest ? {
-        id: latest.contentDetails?.videoId,
-        title: latest.snippet?.title,
-        publishedAt: latest.contentDetails?.videoPublishedAt ?? latest.snippet?.publishedAt,
-        url: `https://www.youtube.com/watch?v=${latest.contentDetails?.videoId}`,
-        thumbnail: latest.snippet?.thumbnails?.medium?.url,
-      } : null,
+      channel: { id: channel.id, title: channel.title },
+      latestVideo,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "Erro ao consultar o YouTube.";
