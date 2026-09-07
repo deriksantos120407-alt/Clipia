@@ -63,6 +63,7 @@ export async function POST(request: NextRequest) {
       },
       body: JSON.stringify({
         job_id: job.id,
+        user_id: job.user_id,
         source: {
           video_id: job.source_video_id,
           url: job.source_video_url,
