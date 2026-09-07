@@ -7,6 +7,16 @@ import { getPlanByPriceId, PLANS, type PlanKey } from "../lib/billing";
 
 type HistoryItem = { id: string; stage: string; status: string; detail: string | null; created_at: string };
 type Subscription = { stripe_price_id: string | null; status: string; current_period_end: string | null };
+type ClipResult = { index: number; path: string; start: number; end: number; title?: string };
+type ProcessingJob = {
+  id: string;
+  status: string;
+  progress: number;
+  source_video_title: string | null;
+  result: { clips?: ClipResult[] } | null;
+  error: string | null;
+  created_at: string;
+};
 type YouTubeResult = {
   error?: string;
   channel?: { id: string; title?: string };
@@ -30,6 +40,7 @@ export default function Home() {
   const [tiktok, setTiktok] = useState(false);
   const [tiktokAuto, setTiktokAuto] = useState(false);
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  const [jobs, setJobs] = useState<ProcessingJob[]>([]);
   const [status, setStatus] = useState("Entre para salvar sua automação.");
   const [busy, setBusy] = useState(false);
 
@@ -42,10 +53,21 @@ export default function Home() {
     return () => data.subscription.unsubscribe();
   }, [supabase]);
 
+  async function loadJobs() {
+    if (!user) return setJobs([]);
+    const { data } = await supabase
+      .from("processing_jobs")
+      .select("id,status,progress,source_video_title,result,error,created_at")
+      .order("created_at", { ascending: false })
+      .limit(8);
+    setJobs((data as ProcessingJob[]) ?? []);
+  }
+
   useEffect(() => {
     if (!user) {
       setSubscription(null);
       setHistory([]);
+      setJobs([]);
       return;
     }
 
@@ -54,6 +76,10 @@ export default function Home() {
 
     supabase.from("subscriptions").select("stripe_price_id,status,current_period_end").maybeSingle()
       .then(({ data }) => setSubscription((data as Subscription | null) ?? null));
+
+    void loadJobs();
+    const timer = window.setInterval(() => void loadJobs(), 5000);
+    return () => window.clearInterval(timer);
   }, [supabase, user]);
 
   useEffect(() => {
@@ -99,6 +125,15 @@ export default function Home() {
     window.location.href = payload.url;
   }
 
+  async function openClip(path: string) {
+    const { data, error } = await supabase.storage.from("clips").createSignedUrl(path, 3600);
+    if (error || !data?.signedUrl) {
+      setStatus(`Não foi possível abrir o corte: ${error?.message ?? "link indisponível"}`);
+      return;
+    }
+    window.open(data.signedUrl, "_blank", "noopener,noreferrer");
+  }
+
   async function saveAutomation(event: FormEvent) {
     event.preventDefault();
     if (!user) return setStatus("Entre na sua conta antes de continuar.");
@@ -109,11 +144,12 @@ export default function Home() {
     setStatus("Localizando o canal e o vídeo mais recente...");
 
     const { data: { session } } = await supabase.auth.getSession();
+    const accessToken = session?.access_token ?? "";
     const youtubeResponse = await fetch("/api/youtube/latest", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${session?.access_token ?? ""}`,
+        Authorization: `Bearer ${accessToken}`,
       },
       body: JSON.stringify({ channelUrl: channelUrl.trim() }),
     });
@@ -135,9 +171,10 @@ export default function Home() {
     }).select("id").single();
     if (error) { setStatus(`Erro ao salvar: ${error.message}`); setBusy(false); return; }
 
+    let createdJobId: string | null = null;
     if (youtube.latestVideo?.id && youtube.latestVideo.url) {
       setStatus("Criando o trabalho de processamento...");
-      const { error: jobError } = await supabase.from("processing_jobs").upsert({
+      const { data: job, error: jobError } = await supabase.from("processing_jobs").upsert({
         automation_id: saved.id,
         user_id: user.id,
         source_video_id: youtube.latestVideo.id,
@@ -147,8 +184,15 @@ export default function Home() {
         clip_duration: duration,
         captions_enabled: captions,
         status: "queued",
-      }, { onConflict: "user_id,source_video_id" });
-      if (jobError) { setStatus(`Erro ao criar processamento: ${jobError.message}`); setBusy(false); return; }
+        progress: 0,
+        result: null,
+        error: null,
+        worker_job_id: null,
+        claimed_at: null,
+        completed_at: null,
+      }, { onConflict: "user_id,source_video_id" }).select("id").single();
+      if (jobError || !job) { setStatus(`Erro ao criar processamento: ${jobError?.message ?? "trabalho não criado"}`); setBusy(false); return; }
+      createdJobId = job.id;
     }
 
     const steps = [
@@ -160,9 +204,27 @@ export default function Home() {
 
     const historyResult = await supabase.from("automation_history").insert(steps).select("*");
     if (historyResult.data) setHistory([...(historyResult.data as HistoryItem[]).reverse(), ...history]);
-    setStatus(youtube.latestVideo
-      ? `Vídeo enfileirado para gerar os cortes: ${youtube.latestVideo.title}`
-      : "Automação salva. O canal ainda não possui vídeo público.");
+
+    if (createdJobId) {
+      setStatus(`Iniciando geração de ${cuts} cortes...`);
+      const dispatchResponse = await fetch("/api/processing/dispatch", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${accessToken}`,
+        },
+        body: JSON.stringify({ jobId: createdJobId }),
+      });
+      const dispatch = await dispatchResponse.json() as { error?: string; status?: string };
+      if (!dispatchResponse.ok) {
+        setStatus(`Vídeo enfileirado, mas o motor não iniciou: ${dispatch.error ?? "tente novamente em instantes."}`);
+      } else {
+        setStatus(`Gerando ${cuts} cortes de ${duration}s. O progresso aparece ao lado.`);
+      }
+      await loadJobs();
+    } else {
+      setStatus("Automação salva. O canal ainda não possui vídeo público.");
+    }
     setBusy(false);
   }
 
@@ -213,11 +275,25 @@ export default function Home() {
         </div>
         <div className="toggleList"><Toggle label="Legendas automáticas" checked={captions} onChange={setCaptions}/><Toggle label="Automação para novos vídeos" checked={automation} onChange={setAutomation}/></div>
         <div className="socialGrid"><Social name="Instagram" enabled={instagram} setEnabled={setInstagram} auto={instagramAuto} setAuto={setInstagramAuto}/><Social name="TikTok" enabled={tiktok} setEnabled={setTiktok} auto={tiktokAuto} setAuto={setTiktokAuto}/></div>
-        <button className="btn" disabled={busy || (billingEnabled && !activeSubscription)}>{busy ? "Verificando..." : billingEnabled && !activeSubscription ? "Assinatura necessária" : "Conectar canal e salvar"}</button>
+        <button className="btn" disabled={busy || (billingEnabled && !activeSubscription)}>{busy ? "Verificando..." : billingEnabled && !activeSubscription ? "Assinatura necessária" : "Conectar canal e gerar cortes"}</button>
         <div className="status" aria-live="polite">{status}</div>
         <button className="textButton" type="button" onClick={() => supabase.auth.signOut()}>Sair da conta</button>
       </form>
-      <aside className="card"><span className="muted small">HISTÓRICO REAL</span><h2>Etapas do fluxo</h2><div className="steps">{history.length === 0 ? <p className="muted">Nenhuma automação salva ainda.</p> : history.map((item) => <div className={`step ${item.status}`} key={item.id}><span className="stepDot">{item.status === "done" ? "✓" : "•"}</span><div><strong>{item.stage}</strong><p>{item.detail}</p></div></div>)}</div></aside>
+      <aside className="card">
+        <span className="muted small">PROCESSAMENTO</span><h2>Seus cortes</h2>
+        <div className="steps">
+          {jobs.length === 0 ? <p className="muted">Nenhum corte gerado ainda.</p> : jobs.map((job) => <div className={`step ${job.status === "ready" ? "done" : job.status === "failed" ? "error" : "active"}`} key={job.id}>
+            <span className="stepDot">{job.status === "ready" ? "✓" : job.status === "failed" ? "!" : "•"}</span>
+            <div>
+              <strong>{job.source_video_title ?? "Vídeo do YouTube"}</strong>
+              <p>{job.status === "ready" ? "Cortes prontos" : job.status === "failed" ? `Falha: ${job.error ?? "erro no processamento"}` : `${job.status} · ${job.progress ?? 0}%`}</p>
+              {job.status === "ready" && job.result?.clips?.map((clip) => <button className="textButton" type="button" key={clip.path} onClick={() => openClip(clip.path)}>Abrir corte {clip.index}</button>)}
+            </div>
+          </div>)}
+        </div>
+        <span className="muted small">HISTÓRICO REAL</span><h2>Etapas do fluxo</h2>
+        <div className="steps">{history.length === 0 ? <p className="muted">Nenhuma automação salva ainda.</p> : history.map((item) => <div className={`step ${item.status}`} key={item.id}><span className="stepDot">{item.status === "done" ? "✓" : "•"}</span><div><strong>{item.stage}</strong><p>{item.detail}</p></div></div>)}</div>
+      </aside>
     </section>}
     <footer className="footer">© 2026 ClipIA · Automação de cortes para seus canais.</footer>
   </div></main>;
