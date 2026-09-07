@@ -59,7 +59,7 @@ export async function POST(request: NextRequest) {
       .from("processing_jobs")
       .update(update)
       .eq("id", jobId)
-      .select("id,user_id,status,progress,result,error")
+      .select("id,automation_id,user_id,status,progress,result,error")
       .single();
 
     if (error || !data) return NextResponse.json({ error: "Trabalho não encontrado." }, { status: 404 });
@@ -69,12 +69,12 @@ export async function POST(request: NextRequest) {
         ? "Cortes finalizados e prontos para uso."
         : (typeof body?.error === "string" ? body.error : "Falha ao gerar os cortes.");
       await supabase.from("automation_history").insert({
-        automation_id: body?.automation_id ?? null,
+        automation_id: data.automation_id,
         user_id: data.user_id,
         stage: status === "ready" ? "Cortes finalizados" : "Falha no processamento",
         status: status === "ready" ? "done" : "error",
         detail,
-      }).then(() => undefined).catch(() => undefined);
+      });
     }
 
     return NextResponse.json({ received: true, status: data.status, progress: data.progress });
