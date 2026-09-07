@@ -134,6 +134,24 @@ export default function Home() {
     window.open(data.signedUrl, "_blank", "noopener,noreferrer");
   }
 
+  async function startJob(jobId: string) {
+    setBusy(true);
+    setStatus("Iniciando o motor de cortes...");
+    const { data: { session } } = await supabase.auth.getSession();
+    const response = await fetch("/api/processing/dispatch", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${session?.access_token ?? ""}`,
+      },
+      body: JSON.stringify({ jobId }),
+    });
+    const payload = await response.json() as { error?: string };
+    setStatus(response.ok ? "Processamento iniciado. Acompanhe o progresso ao lado." : `Não foi possível iniciar: ${payload.error ?? "tente novamente."}`);
+    await loadJobs();
+    setBusy(false);
+  }
+
   async function saveAutomation(event: FormEvent) {
     event.preventDefault();
     if (!user) return setStatus("Entre na sua conta antes de continuar.");
@@ -287,6 +305,7 @@ export default function Home() {
             <div>
               <strong>{job.source_video_title ?? "Vídeo do YouTube"}</strong>
               <p>{job.status === "ready" ? "Cortes prontos" : job.status === "failed" ? `Falha: ${job.error ?? "erro no processamento"}` : `${job.status} · ${job.progress ?? 0}%`}</p>
+              {(job.status === "queued" || job.status === "failed") && <button className="textButton" type="button" disabled={busy} onClick={() => startJob(job.id)}>{job.status === "failed" ? "Tentar novamente" : "Iniciar processamento"}</button>}
               {job.status === "ready" && job.result?.clips?.map((clip) => <button className="textButton" type="button" key={clip.path} onClick={() => openClip(clip.path)}>Abrir corte {clip.index}</button>)}
             </div>
           </div>)}
