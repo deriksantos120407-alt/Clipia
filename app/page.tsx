@@ -212,7 +212,7 @@ export default function Home() {
           <div><label className="label">Duração</label><select className="field" value={duration} onChange={(e) => setDuration(Number(e.target.value))}><option value={15}>15 segundos</option><option value={30}>30 segundos</option><option value={45}>45 segundos</option><option value={60}>60 segundos</option></select></div>
         </div>
         <div className="toggleList"><Toggle label="Legendas automáticas" checked={captions} onChange={setCaptions}/><Toggle label="Automação para novos vídeos" checked={automation} onChange={setAutomation}/></div>
-        <div className="socialGrid"><Social name="Instagram" enabled={instagram} setEnabled={setInstagram} auto={instagramAuto} setAuto={setInstagramAuto}/><Social name="TikTok" enabled={tiktok} setEnabled={setTikTok} auto={tiktokAuto} setAuto={setTikTokAuto}/></div>
+        <div className="socialGrid"><Social name="Instagram" enabled={instagram} setEnabled={setInstagram} auto={instagramAuto} setAuto={setInstagramAuto}/><Social name="TikTok" enabled={tiktok} setEnabled={setTiktok} auto={tiktokAuto} setAuto={setTiktokAuto}/></div>
         <button className="btn" disabled={busy || (billingEnabled && !activeSubscription)}>{busy ? "Verificando..." : billingEnabled && !activeSubscription ? "Assinatura necessária" : "Conectar canal e salvar"}</button>
         <div className="status" aria-live="polite">{status}</div>
         <button className="textButton" type="button" onClick={() => supabase.auth.signOut()}>Sair da conta</button>
