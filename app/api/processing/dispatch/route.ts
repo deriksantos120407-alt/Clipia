@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
 const ACTIVE_SUBSCRIPTION_STATUSES = new Set(["active", "trialing"]);
+const DEFAULT_WORKER_URL = "https://clipia-worker-production.up.railway.app/jobs";
 
 function getSupabase() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
@@ -37,7 +38,7 @@ export async function POST(request: NextRequest) {
 
     const { data: job, error: jobError } = await supabase
       .from("processing_jobs")
-      .select("id,user_id,source_video_id,source_video_url,source_video_title,requested_cuts,clip_duration,captions_enabled,status")
+      .select("id,automation_id,user_id,source_video_id,source_video_url,source_video_title,requested_cuts,clip_duration,captions_enabled,status")
       .eq("id", jobId)
       .eq("user_id", user.id)
       .single();
@@ -45,24 +46,16 @@ export async function POST(request: NextRequest) {
     if (jobError || !job) return NextResponse.json({ error: "Processamento não encontrado." }, { status: 404 });
     if (job.status === "ready") return NextResponse.json({ ok: true, status: "ready" });
 
-    const workerUrl = process.env.CLIP_WORKER_URL;
-    const workerToken = process.env.CLIP_WORKER_TOKEN;
-    if (!workerUrl || !workerToken) {
-      return NextResponse.json({
-        queued: true,
-        error: "Motor de renderização ainda não conectado. O trabalho ficou na fila.",
-      }, { status: 503 });
-    }
-
-    const callbackUrl = new URL("/api/processing/callback", request.nextUrl.origin).toString();
+    const workerUrl = process.env.CLIP_WORKER_URL || DEFAULT_WORKER_URL;
     const workerResponse = await fetch(workerUrl, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${workerToken}`,
+        Authorization: `Bearer ${token}`,
       },
       body: JSON.stringify({
         job_id: job.id,
+        automation_id: job.automation_id,
         user_id: job.user_id,
         source: {
           video_id: job.source_video_id,
@@ -75,19 +68,18 @@ export async function POST(request: NextRequest) {
           captions: job.captions_enabled,
           aspect_ratio: "9:16",
         },
-        callback_url: callbackUrl,
       }),
       cache: "no-store",
     });
 
-    const workerData = await workerResponse.json().catch(() => ({})) as { job_id?: string; id?: string; error?: string };
+    const workerData = await workerResponse.json().catch(() => ({})) as { job_id?: string; id?: string; detail?: string; error?: string };
     if (!workerResponse.ok) {
-      const detail = workerData.error ?? "O motor de vídeo não aceitou o trabalho.";
+      const detail = workerData.error ?? workerData.detail ?? "O motor de vídeo não aceitou o trabalho.";
       await supabase.from("processing_jobs").update({ error: detail }).eq("id", job.id).eq("user_id", user.id);
       return NextResponse.json({ error: detail }, { status: 502 });
     }
 
-    const workerJobId = workerData.job_id ?? workerData.id ?? null;
+    const workerJobId = workerData.job_id ?? workerData.id ?? job.id;
     const { error: updateError } = await supabase
       .from("processing_jobs")
       .update({
