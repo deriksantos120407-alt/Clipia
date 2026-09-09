@@ -4,11 +4,17 @@ import { createClient } from "@supabase/supabase-js";
 const ACTIVE_SUBSCRIPTION_STATUSES = new Set(["active", "trialing"]);
 const DEFAULT_WORKER_URL = "https://clipia-worker-production.up.railway.app/jobs";
 
-function getSupabase() {
+function getSupabase(token?: string) {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY;
   if (!url || !key) throw new Error("Supabase não configurado.");
-  return createClient(url, key, { auth: { persistSession: false } });
+
+  return createClient(url, key, {
+    auth: { persistSession: false },
+    global: token
+      ? { headers: { Authorization: `Bearer ${token}` } }
+      : undefined,
+  });
 }
 
 export async function POST(request: NextRequest) {
@@ -21,7 +27,11 @@ export async function POST(request: NextRequest) {
     const jobId = typeof body?.jobId === "string" ? body.jobId : "";
     if (!jobId) return NextResponse.json({ error: "Trabalho de processamento inválido." }, { status: 400 });
 
-    const supabase = getSupabase();
+    // Important: use the user's JWT on every Supabase query so RLS can see
+    // the authenticated user. Previously the route validated the JWT, but
+    // subsequent processing_jobs queries were executed as anon, which made
+    // an existing job look like it did not exist.
+    const supabase = getSupabase(token);
     const { data: { user }, error: authError } = await supabase.auth.getUser(token);
     if (authError || !user) return NextResponse.json({ error: "Sessão inválida. Entre novamente." }, { status: 401 });
 
